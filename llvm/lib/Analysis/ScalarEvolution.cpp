@@ -199,6 +199,12 @@ static cl::opt<unsigned>
                   cl::desc("Maximum depth of recursive arithmetics"),
                   cl::init(32));
 
+static cl::opt<unsigned> MaxDomTreeGuardSteps(
+    "scalar-evolution-max-dom-tree-guard-steps", cl::Hidden,
+    cl::desc("Maximum number of dominator tree steps taken per query to find "
+             "a guard edge dominating a join that is not a loop header"),
+    cl::init(8));
+
 static cl::opt<unsigned> MaxConstantEvolvingDepth(
     "scalar-evolution-max-constant-evolving-depth", cl::Hidden,
     cl::desc("Maximum depth of recursive constant evolving"), cl::init(32));
@@ -12047,6 +12053,28 @@ bool ScalarEvolution::isBasicBlockEntryGuardedByCond(const BasicBlock *BB,
     return false;
   };
 
+  // A join that is not a loop header has no unique predecessor edge, and
+  // getPredecessorWithUniqueSuccessorForBB would leave the enclosing loop.
+  // Instead, climb the dominator tree to the nearest edge dominating it. Every
+  // edge found this way costs an isImpliedCond query, so the climb is bounded
+  // per query; once the budget is spent, fall back to leaving the loop.
+  unsigned DomTreeSteps = 0;
+  auto GetDominatingEdge = [&](const BasicBlock *Block)
+      -> std::pair<const BasicBlock *, const BasicBlock *> {
+    if (Block->getSinglePredecessor() || LI.isLoopHeader(Block))
+      return getPredecessorWithUniqueSuccessorForBB(Block);
+    for (const DomTreeNode *N = DT.getNode(Block);
+         N && N->getIDom() && DomTreeSteps < MaxDomTreeGuardSteps;
+         N = N->getIDom()) {
+      ++DomTreeSteps;
+      const BasicBlock *IDom = N->getIDom()->getBlock();
+      for (const BasicBlock *Succ : successors(IDom))
+        if (DT.dominates(BasicBlockEdge(IDom, Succ), Block))
+          return {IDom, Succ};
+    }
+    return getPredecessorWithUniqueSuccessorForBB(Block);
+  };
+
   // Starting at the block's predecessor, climb up the predecessor chain, as long
   // as there are predecessors that can be found that have unique successors
   // leading to the original block.
@@ -12057,7 +12085,7 @@ bool ScalarEvolution::isBasicBlockEntryGuardedByCond(const BasicBlock *BB,
   else
     PredBB = BB->getSinglePredecessor();
   for (std::pair<const BasicBlock *, const BasicBlock *> Pair(PredBB, BB);
-       Pair.first; Pair = getPredecessorWithUniqueSuccessorForBB(Pair.first)) {
+       Pair.first; Pair = GetDominatingEdge(Pair.first)) {
     const CondBrInst *BlockEntryPredicate =
         dyn_cast<CondBrInst>(Pair.first->getTerminator());
     if (!BlockEntryPredicate)
